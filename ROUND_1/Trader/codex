@@ -1,0 +1,330 @@
+# trader.py - micro-optimized Pepper + Osmium
+import json
+import math
+from typing import Dict, List, Optional
+
+from datamodel import Order, OrderDepth, TradingState
+
+
+class Trader:
+    PEPPER = "INTARIAN_PEPPER_ROOT"
+    OSMIUM = "ASH_COATED_OSMIUM"
+    LIMIT = 50
+
+    PEPPER_SLOPE = 0.001
+    PEPPER_BUY_TOL = 15
+    PEPPER_OPEN_NEAR_GAP = 2
+    PEPPER_PRE_RUSH_GAP = 4
+    PEPPER_OPEN_PATIENCE = 300
+    PEPPER_RUSH_START = 1200
+
+    OSM_FAIR_FALLBACK = 10_000
+    OSM_EMA_ALPHA = 0.025
+    OSM_L1_SIZE = 18
+    OSM_L2_SIZE = 13
+    OSM_L3_SIZE = 8
+    OSM_MR_MAX_QTY = 18
+    OSM_SKEW_FACTOR = 0.08
+
+    ROUND_DAYS = 3
+    MAX_TS = 99_900
+    ENDGAME_START = 99_200
+    NEW_DAY_THRESH = 10_000
+
+    def run(self, state: TradingState):
+        try:
+            data: dict = json.loads(state.traderData) if state.traderData else {}
+        except Exception:
+            data = {}
+
+        ts = state.timestamp
+        prev_ts = data.get("last_ts", -1)
+        day = data.get("day", 0)
+
+        if prev_ts > self.NEW_DAY_THRESH and ts < self.NEW_DAY_THRESH:
+            day += 1
+            data["day"] = day
+            data.pop("pepper_anchor", None)
+            data.pop("pepper_open_ts", None)
+            data.pop("pepper_open_ask", None)
+            data.pop("osm_ema", None)
+            data.pop("osm_last_spread", None)
+
+        if "pepper_anchor" not in data:
+            data["pepper_anchor"] = self._pepper_anchor(state)
+            data["pepper_open_ts"] = ts
+            data["pepper_open_ask"] = self._best_ask(state, self.PEPPER)
+
+        pepper_fair = data["pepper_anchor"] + self.PEPPER_SLOPE * ts
+
+        is_last_day = day >= self.ROUND_DAYS - 1
+        is_endgame = is_last_day and ts >= self.ENDGAME_START
+
+        orders: Dict[str, List[Order]] = {}
+
+        pepper_orders = self._pepper_orders(state, data, ts, pepper_fair, is_endgame)
+        if pepper_orders:
+            orders[self.PEPPER] = pepper_orders
+
+        osmium_orders = self._osmium_orders(state, data)
+        if osmium_orders:
+            orders[self.OSMIUM] = osmium_orders
+
+        data["last_ts"] = ts
+        return orders, 0, json.dumps(data)
+
+    def _best_bid(self, state: TradingState, product: str) -> Optional[int]:
+        od = state.order_depths.get(product, OrderDepth())
+        return max(od.buy_orders.keys()) if od.buy_orders else None
+
+    def _best_ask(self, state: TradingState, product: str) -> Optional[int]:
+        od = state.order_depths.get(product, OrderDepth())
+        return min(od.sell_orders.keys()) if od.sell_orders else None
+
+    def _pepper_anchor(self, state: TradingState) -> float:
+        od = state.order_depths.get(self.PEPPER, OrderDepth())
+        asks = sorted(od.sell_orders.items())
+        bids = sorted(od.buy_orders.items(), reverse=True)
+
+        if asks:
+            best_ask = asks[0][0]
+            weighted = 0.0
+            total = 0
+            for idx, (ask_px, ask_vol) in enumerate(asks):
+                qty = max(0, -ask_vol)
+                if qty <= 0:
+                    continue
+                if idx > 0 and ask_px - best_ask > 3:
+                    break
+                weighted += ask_px * qty
+                total += qty
+            if total > 0:
+                vwap = weighted / total
+                if bids:
+                    best_bid = bids[0][0]
+                    spread = max(1, best_ask - best_bid)
+                    return min(vwap, best_ask + max(1.0, spread / 3.0))
+                return min(vwap, best_ask + 1.0)
+            return float(best_ask)
+
+        if bids:
+            return float(bids[0][0] + 1)
+
+        return 12_000.0
+
+    def _pepper_orders(
+        self,
+        state: TradingState,
+        data: dict,
+        ts: int,
+        fair: float,
+        is_endgame: bool,
+    ) -> List[Order]:
+        od = state.order_depths.get(self.PEPPER, OrderDepth())
+        pos = state.position.get(self.PEPPER, 0)
+        orders: List[Order] = []
+
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+
+        if not is_endgame:
+            buy_cap = self.LIMIT - pos
+            if buy_cap <= 0 or not od.sell_orders:
+                return orders
+
+            open_ts = data.get("pepper_open_ts", ts)
+            open_age = max(0, ts - open_ts)
+            reference_ask = data.get("pepper_open_ask", best_ask or 0) or (best_ask or 0)
+            local_best_ask = best_ask if best_ask is not None else reference_ask
+
+            if open_age <= self.PEPPER_OPEN_PATIENCE:
+                gap_limit = self.PEPPER_OPEN_NEAR_GAP
+            elif open_age <= self.PEPPER_RUSH_START:
+                gap_limit = self.PEPPER_PRE_RUSH_GAP
+            else:
+                gap_limit = self.PEPPER_BUY_TOL
+
+            hard_cap = fair + (12 if open_age <= self.PEPPER_OPEN_PATIENCE else self.PEPPER_BUY_TOL)
+
+            for ask_px in sorted(od.sell_orders.keys()):
+                if buy_cap <= 0:
+                    break
+                if ask_px > hard_cap:
+                    break
+                if ask_px - local_best_ask > gap_limit and ask_px - reference_ask > gap_limit:
+                    break
+
+                visible = max(0, -od.sell_orders[ask_px])
+                if visible <= 0:
+                    continue
+                take = min(buy_cap, visible)
+                if take > 0:
+                    orders.append(Order(self.PEPPER, ask_px, take))
+                    buy_cap -= take
+
+            if buy_cap > 0:
+                post_px: Optional[int] = None
+                if best_ask is not None and best_ask <= fair + self.PEPPER_BUY_TOL:
+                    post_px = best_ask
+                elif best_bid is not None:
+                    candidate = best_bid + 1
+                    if candidate <= fair + 2:
+                        post_px = candidate
+                if post_px is not None and post_px > 0:
+                    orders.append(Order(self.PEPPER, post_px, buy_cap))
+
+            return orders
+
+        if pos <= 0 or not od.buy_orders:
+            return orders
+
+        best_bid = max(od.buy_orders.keys())
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else best_bid + 2
+        ticks_left = max(1, (self.MAX_TS - ts) // 100 + 1)
+        clip = max(1, math.ceil(pos / ticks_left))
+        if ts >= self.MAX_TS - 300:
+            clip = max(clip, math.ceil(pos / 2))
+
+        passive_sell_px = best_bid
+        if best_ask - best_bid >= 2:
+            passive_sell_px = best_bid + 1
+        passive_sell_px = min(passive_sell_px, best_ask - 1 if best_ask > best_bid else best_bid)
+        passive_sell_px = max(best_bid, passive_sell_px)
+
+        orders.append(Order(self.PEPPER, passive_sell_px, -min(pos, clip)))
+
+        if ts >= self.MAX_TS - 100 and pos > clip:
+            orders.append(Order(self.PEPPER, best_bid, -(pos - clip)))
+
+        return orders
+
+    def _osmium_orders(self, state: TradingState, data: dict) -> List[Order]:
+        od = state.order_depths.get(self.OSMIUM, OrderDepth())
+        pos = state.position.get(self.OSMIUM, 0)
+        orders: List[Order] = []
+
+        best_bid: Optional[int] = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask: Optional[int] = min(od.sell_orders.keys()) if od.sell_orders else None
+
+        bid_vol = od.buy_orders.get(best_bid, 0) if best_bid is not None else 0
+        ask_vol = -od.sell_orders.get(best_ask, 0) if best_ask is not None else 0
+
+        prev_spread = int(data.get("osm_last_spread", 16))
+
+        if best_bid is not None and best_ask is not None:
+            spread = best_ask - best_bid
+            mid = (best_bid + best_ask) / 2.0
+            denom = bid_vol + ask_vol
+            if denom > 0:
+                micro = (best_bid * ask_vol + best_ask * bid_vol) / denom
+                imbalance = (bid_vol - ask_vol) / denom
+            else:
+                micro = mid
+                imbalance = 0.0
+        elif best_bid is not None:
+            spread = max(8, prev_spread)
+            mid = best_bid + spread / 2.0
+            micro = mid
+            imbalance = 0.0
+        elif best_ask is not None:
+            spread = max(8, prev_spread)
+            mid = best_ask - spread / 2.0
+            micro = mid
+            imbalance = 0.0
+        else:
+            spread = max(8, prev_spread)
+            mid = float(data.get("osm_ema", self.OSM_FAIR_FALLBACK))
+            micro = mid
+            imbalance = 0.0
+
+        raw_fair = 0.35 * mid + 0.65 * micro
+        prev_ema = float(data.get("osm_ema", self.OSM_FAIR_FALLBACK))
+        ema = prev_ema + self.OSM_EMA_ALPHA * (raw_fair - prev_ema)
+        data["osm_ema"] = ema
+        data["osm_last_spread"] = spread
+
+        fair = round(ema)
+        buy_cap = self.LIMIT - pos
+        sell_cap = self.LIMIT + pos
+
+        take_thresh = max(6, min(9, round(spread * 0.38)))
+        max_take_qty = self.OSM_MR_MAX_QTY if abs(pos) < 25 else max(8, self.OSM_MR_MAX_QTY - 6)
+
+        if od.sell_orders and buy_cap > 0:
+            for ask_px in sorted(od.sell_orders.keys()):
+                if ask_px > fair - take_thresh:
+                    break
+                visible = max(0, -od.sell_orders[ask_px])
+                if visible <= 0:
+                    continue
+                take = min(buy_cap, visible, max_take_qty)
+                if take > 0:
+                    orders.append(Order(self.OSMIUM, ask_px, take))
+                    buy_cap -= take
+
+        if od.buy_orders and sell_cap > 0:
+            for bid_px in sorted(od.buy_orders.keys(), reverse=True):
+                if bid_px < fair + take_thresh:
+                    break
+                visible = max(0, od.buy_orders[bid_px])
+                if visible <= 0:
+                    continue
+                take = min(sell_cap, visible, max_take_qty)
+                if take > 0:
+                    orders.append(Order(self.OSMIUM, bid_px, -take))
+                    sell_cap -= take
+
+        skew = int(round(max(-7, min(7, pos * self.OSM_SKEW_FACTOR))))
+
+        inner_offset = max(3, min(4, spread // 5))
+        mid_offset = inner_offset + 3
+        outer_offset = mid_offset + 3 + (1 if spread >= 18 else 0)
+
+        levels = [
+            (inner_offset, self.OSM_L1_SIZE),
+            (mid_offset, self.OSM_L2_SIZE),
+            (outer_offset, self.OSM_L3_SIZE),
+        ]
+
+        inventory_ratio = pos / self.LIMIT
+
+        for offset, base_size in levels:
+            if buy_cap <= 0 and sell_cap <= 0:
+                break
+
+            bid_px = fair - offset - skew
+            ask_px = fair + offset - skew
+
+            if best_bid is not None and best_ask is not None and best_ask - best_bid >= 3:
+                bid_px = max(bid_px, best_bid + 1)
+                ask_px = min(ask_px, best_ask - 1)
+            elif best_bid is not None:
+                bid_px = max(bid_px, best_bid)
+            elif best_ask is not None:
+                ask_px = min(ask_px, best_ask)
+
+            if bid_px >= ask_px:
+                bid_px = min(bid_px, fair - 1)
+                ask_px = max(ask_px, fair + 1)
+
+            imbalance_tilt = max(-2, min(2, int(round(imbalance * 4))))
+            buy_size = max(
+                1,
+                round(base_size * (1 - max(0.0, inventory_ratio) * 0.8)) + max(0, imbalance_tilt),
+            )
+            sell_size = max(
+                1,
+                round(base_size * (1 - max(0.0, -inventory_ratio) * 0.8)) + max(0, -imbalance_tilt),
+            )
+
+            if buy_cap > 0 and bid_px > 0:
+                size = min(buy_size, buy_cap)
+                orders.append(Order(self.OSMIUM, bid_px, size))
+                buy_cap -= size
+
+            if sell_cap > 0:
+                size = min(sell_size, sell_cap)
+                orders.append(Order(self.OSMIUM, ask_px, -size))
+                sell_cap -= size
+
+        return orders
